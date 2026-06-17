@@ -1,4 +1,3 @@
-import Anthropic from '@anthropic-ai/sdk';
 import { requestUrl } from 'obsidian';
 import { LLMClient } from './types';
 
@@ -45,6 +44,17 @@ export class AnthropicCompatibleClient implements LLMClient {
     this.apiVersion = '2023-06-01';
   }
 
+  private headers(): Record<string, string> {
+    return {
+      'x-api-key': this.apiKey,
+      'Anthropic-Version': this.apiVersion,
+      'Content-Type': 'application/json',
+      // Obsidian requests carry Origin: app://obsidian.md; Anthropic rejects
+      // browser-origin requests with 400 unless this header is present.
+      'anthropic-dangerous-direct-browser-access': 'true'
+    };
+  }
+
   private extractText(content: Array<{ type: string; text?: string }>): string {
     const textBlock = content.find(c => c.type === 'text');
     return textBlock?.text || '';
@@ -70,11 +80,7 @@ export class AnthropicCompatibleClient implements LLMClient {
       const response = await requestUrl({
         url: this.baseUrl + '/messages',
         method: 'POST',
-        headers: {
-          'x-api-key': this.apiKey,
-          'Anthropic-Version': this.apiVersion,
-          'Content-Type': 'application/json'
-        },
+        headers: this.headers(),
         body: JSON.stringify(body)
       });
 
@@ -104,11 +110,7 @@ export class AnthropicCompatibleClient implements LLMClient {
           return await requestUrl({
             url: this.baseUrl + '/messages',
             method: 'POST',
-            headers: {
-              'x-api-key': this.apiKey,
-              'Anthropic-Version': this.apiVersion,
-              'Content-Type': 'application/json'
-            },
+            headers: this.headers(),
             body: JSON.stringify({ ...body, max_tokens: retryTokens })
           });
         }, 2, 'Anthropic-compatible truncation retry');
@@ -160,11 +162,7 @@ export class AnthropicCompatibleClient implements LLMClient {
       response = await requestUrl({
         url: this.baseUrl + '/messages',
         method: 'POST',
-        headers: {
-          'x-api-key': this.apiKey,
-          'Anthropic-Version': this.apiVersion,
-          'Content-Type': 'application/json'
-        },
+        headers: this.headers(),
         body: JSON.stringify(body)
       });
     } catch (err) {
@@ -243,16 +241,39 @@ export class AnthropicCompatibleClient implements LLMClient {
     return Promise.resolve([]);
   }
 }
+// Anthropic message content: either a plain string or text blocks (used for
+// prompt-cache breakpoints). Mirrors the subset of the Messages API we send.
+type AnthropicContentBlock = { type: 'text'; text: string; cache_control?: { type: 'ephemeral' } };
+type AnthropicMessage = { role: 'user' | 'assistant'; content: string | AnthropicContentBlock[] };
+
 export class AnthropicClient implements LLMClient {
-  private client: Anthropic;
   private apiKey: string;
+  private baseUrl: string;
+  private apiVersion: string;
 
   constructor(apiKey: string, baseUrl?: string) {
     this.apiKey = apiKey;
-    this.client = new Anthropic({
-      apiKey,
-      ...(baseUrl ? { baseURL: baseUrl } : {})
-    });
+    // Normalize so the endpoint is always <base>/v1/messages. Anthropic's API
+    // lives under /v1; posting to /messages (no /v1) returns 404.
+    this.baseUrl = (baseUrl || 'https://api.anthropic.com')
+      .replace(/\/v1\/?$/, '').replace(/\/+$/, '') + '/v1';
+    this.apiVersion = '2023-06-01';
+  }
+
+  private headers(): Record<string, string> {
+    return {
+      'x-api-key': this.apiKey,
+      'Anthropic-Version': this.apiVersion,
+      'Content-Type': 'application/json',
+      // Obsidian requests carry Origin: app://obsidian.md; Anthropic rejects
+      // browser-origin requests with 400 unless this header is present.
+      'anthropic-dangerous-direct-browser-access': 'true'
+    };
+  }
+
+  private extractText(content: Array<{ type: string; text?: string }>): string {
+    const textBlock = content.find(c => c.type === 'text');
+    return textBlock?.text || '';
   }
 
   async createMessage(params: {
@@ -264,51 +285,69 @@ export class AnthropicClient implements LLMClient {
     cacheBreakpoint?: number;
   }): Promise<string> {
     // Support prompt caching: split first user message at cacheBreakpoint
-    const messages = params.messages.map((msg, idx) => {
+    const messages: AnthropicMessage[] = params.messages.map((msg, idx): AnthropicMessage => {
       if (idx === 0 && msg.role === 'user' && params.cacheBreakpoint &&
           params.cacheBreakpoint > 0 && params.cacheBreakpoint < msg.content.length) {
         const cached = msg.content.substring(0, params.cacheBreakpoint);
         const rest = msg.content.substring(params.cacheBreakpoint);
         return {
-          role: 'user' as const,
+          role: 'user',
           content: [
-            { type: 'text' as const, text: cached, cache_control: { type: 'ephemeral' as const } },
-            { type: 'text' as const, text: rest }
+            { type: 'text', text: cached, cache_control: { type: 'ephemeral' } },
+            { type: 'text', text: rest }
           ]
         };
       }
       return msg;
     });
 
-    const finalMessages = params.response_format?.type === 'json_object'
+    const finalMessages: AnthropicMessage[] = params.response_format?.type === 'json_object'
       ? [...messages, { role: 'assistant' as const, content: '{' }]
       : messages;
 
+    const body: Record<string, unknown> = {
+      model: params.model,
+      max_tokens: params.max_tokens,
+      messages: finalMessages
+    };
+    if (params.system) body.system = params.system;
+
     return withRetry(async () => {
-      const response = await this.client.messages.create({
-        model: params.model,
-        max_tokens: params.max_tokens,
-        system: params.system || undefined,
-        messages: finalMessages
+      const response = await requestUrl({
+        url: this.baseUrl + '/messages',
+        method: 'POST',
+        headers: this.headers(),
+        body: JSON.stringify(body)
       });
-      const textBlock = response.content.find(c => c.type === 'text');
-      let text = textBlock && 'text' in textBlock ? textBlock.text : '';
+
+      const data = response.json as {
+        content?: Array<{ type: string; text?: string }>;
+        stop_reason?: string;
+        error?: { message: string };
+      };
+
+      if (data.error) throw new Error(`status ${response.status}: ${data.error.message}`);
+      let text = this.extractText(data.content || []);
 
       // Detect truncation: retry once with double the token limit.
-      if (response.stop_reason === 'max_tokens') {
+      if (data.stop_reason === 'max_tokens') {
         const retryTokens = Math.min(params.max_tokens * 2, 16000);
         console.warn(
           `Anthropic response truncated at ${params.max_tokens} tokens (stop_reason=max_tokens). ` +
           `Retrying with ${retryTokens} tokens.`
         );
-        const retryResponse = await this.client.messages.create({
-          model: params.model,
-          max_tokens: retryTokens,
-          system: params.system || undefined,
-          messages: finalMessages
+        const retryResponse = await requestUrl({
+          url: this.baseUrl + '/messages',
+          method: 'POST',
+          headers: this.headers(),
+          body: JSON.stringify({ ...body, max_tokens: retryTokens })
         });
-        const retryBlock = retryResponse.content.find(c => c.type === 'text');
-        text = retryBlock && 'text' in retryBlock ? retryBlock.text : '';
+        const retryData = retryResponse.json as {
+          content?: Array<{ type: string; text?: string }>;
+          error?: { message: string };
+        };
+        if (retryData.error) throw new Error(`status ${retryResponse.status}: ${retryData.error.message}`);
+        text = this.extractText(retryData.content || []);
       }
 
       // Safety: if prefill { was stripped by the provider, restore it
@@ -326,41 +365,93 @@ export class AnthropicClient implements LLMClient {
     messages: Array<{role: 'user' | 'assistant'; content: string}>;
     onChunk: (chunk: string) => void;
   }): Promise<string> {
-    const messagesWithLanguageHint = params.system
-      ? params.messages
-      : [
-        ...params.messages,
-        {
-          role: 'user',
-          content: 'Please respond in the same language as the user\'s question. If the user asks in Chinese, reply in Chinese. If the user asks in English, reply in English. Keep the response language consistent with the user\'s input language.'
-        }
-      ];
+    const messages = params.system ? params.messages : [
+      ...params.messages,
+      {
+        role: 'user',
+        content: 'Please respond in the same language as the user\'s question. If the user asks in Chinese, reply in Chinese. If the user asks in English, reply in English. Keep the response language consistent with the user\'s input language.'
+      }
+    ];
 
-    const stream = this.client.messages.stream({
+    const body: Record<string, unknown> = {
       model: params.model,
       max_tokens: params.max_tokens,
-      system: params.system || undefined,
-      messages: messagesWithLanguageHint as Anthropic.MessageParam[]
-    });
+      messages,
+      stream: true
+    };
+    if (params.system) body.system = params.system;
 
-    let fullResponse = '';
+    let response;
+    try {
+      response = await requestUrl({
+        url: this.baseUrl + '/messages',
+        method: 'POST',
+        headers: this.headers(),
+        body: JSON.stringify(body)
+      });
+    } catch (err) {
+      console.error('[Anthropic SSE] requestUrl request failed:', err);
+      throw err;
+    }
 
-    stream.on('text', (text) => {
-      fullResponse += text;
-      params.onChunk(text);
-    });
+    const responseText = response.text;
 
-    await stream.finalMessage();
-    return fullResponse;
+    // Parse SSE events from the response body. requestUrl returns the full body
+    // at once, so we parse the accumulated stream rather than reading incrementally.
+    let fullText = '';
+    const normalizedText = responseText.replace(/\r\n/g, '\n');
+    const events = normalizedText.split('\n\n');
+    for (const event of events) {
+      if (!event.trim()) continue;
+      const dataLine = event.split('\n').find(line => line.startsWith('data:'));
+      if (!dataLine) continue;
+      try {
+        const jsonStart = dataLine.indexOf('{');
+        if (jsonStart === -1) continue;
+        const parsed = JSON.parse(dataLine.substring(jsonStart)) as {
+          type?: string;
+          delta?: { type?: string; text?: string };
+        };
+        if (parsed.type === 'content_block_delta' &&
+            parsed.delta?.type === 'text_delta' &&
+            parsed.delta.text) {
+          fullText += parsed.delta.text;
+          params.onChunk(parsed.delta.text);
+        }
+      } catch {
+        // Skip malformed JSON in SSE
+      }
+    }
+
+    // Fallback: some endpoints ignore stream:true and return a standard JSON body.
+    if (!fullText) {
+      try {
+        const data = JSON.parse(responseText) as {
+          content?: Array<{ type: string; text?: string }>;
+          error?: { message: string };
+        };
+        if (data.error) throw new Error(data.error.message);
+        fullText = this.extractText(data.content || []);
+        if (fullText) params.onChunk(fullText);
+      } catch (parseErr) {
+        console.debug('[Anthropic SSE] non-streaming JSON parse failed:', parseErr);
+      }
+    }
+
+    if (!fullText) {
+      throw new Error(
+        'Anthropic endpoint returned neither SSE events nor a standard JSON response. ' +
+        'Response preview: ' + responseText.substring(0, 300)
+      );
+    }
+
+    return fullText;
   }
 
   async listModels(): Promise<string[]> {
     const response = await requestUrl({
-      url: 'https://api.anthropic.com/v1/models',
-      headers: {
-        'x-api-key': this.apiKey,
-        'Anthropic-Version': '2023-06-01'
-      }
+      url: this.baseUrl + '/models',
+      headers: this.headers()
     });
     const data = response.json as { data?: Array<{ id: string }> };
     if (!data.data?.length) return [];
