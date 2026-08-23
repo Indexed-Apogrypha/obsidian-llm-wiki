@@ -1,0 +1,81 @@
+# ============================================================================
+# gemma4:26b — tuned for the Obsidian LLM Wiki plugin (Karpathy LLM Wiki)
+# ============================================================================
+#
+# Build:   ollama pull gemma4:26b
+#          ollama create gemma4-wiki -f gemma4-26b-wiki.Modelfile
+# Verify:  ollama run gemma4-wiki "Reply with exactly: ok"
+#          ollama show gemma4-wiki        # confirm context length = 65536
+#
+# Plugin settings (Settings → LLM Wiki → LLM Configuration):
+#   Provider:  Ollama (Local)
+#   Base URL:  http://localhost:11434/v1   (plugin default)
+#   API Key:   ollama                      (any non-empty string works)
+#   Model:     gemma4-wiki
+#
+# See docs/OLLAMA-GEMMA4-GUIDE.md for VRAM tuning and troubleshooting.
+
+FROM gemma4:26b
+
+# ---------------------------------------------------------------------------
+# Context window — the single most important parameter.
+#
+# The plugin talks to Ollama over the OpenAI-compatible API, which carries
+# no context-size field, so Ollama silently uses the model's default
+# (4096 unless OLLAMA_CONTEXT_LENGTH is raised). That truncates real
+# plugin traffic without any error:
+#
+#   - Lint dedup batches budget up to 15,000 input tokens
+#     (LINT_MAX_INPUT_TOKENS) plus an 8,000-token output budget
+#     (TOKENS_LINT_DEDUP_LLM).
+#   - Query Wiki assembles up to 10 pages × 12,800 chars (~32K tokens
+#     of page context) plus an 8,000-token answer budget
+#     (TOKENS_QUERY_ANSWER).
+#   - Source extraction batches cap output at 16,000 tokens
+#     (MAX_TOKENS_BATCH) on top of a 1–3K-token prompt + source chunk.
+#
+# 65536 covers every call path with headroom. Gemma 4 supports 262144;
+# raise this if you query very large vaults and have the memory.
+# Drop to 32768 only on tight VRAM — Query Wiki on big vaults may then
+# truncate context (the plugin's overflow fallback shrinks pages to
+# compensate, at some quality cost).
+PARAMETER num_ctx 65536
+
+# ---------------------------------------------------------------------------
+# Sampling — biased toward schema fidelity, not creativity.
+#
+# In the plugin's default mode ("Default" LLM parameters) no temperature /
+# top_p / repeat_penalty is sent on the wire, so these values govern every
+# call. If you switch the plugin to "Custom" advanced parameters, its
+# per-call values override these.
+#
+# Gemma's reference sampling is temperature 1.0 / top_k 64 / top_p 0.95.
+# Extraction and lint calls must return strict JSON that survives the
+# plugin's json_schema response_format, so temperature is pulled down to
+# 0.2 — low enough for reliable structure, high enough to avoid the
+# degenerate repetition that greedy decoding can trigger on long outputs.
+PARAMETER temperature 0.2
+PARAMETER top_k 64
+PARAMETER top_p 0.95
+
+# Keep repeat_penalty neutral. The plugin's own settings docs warn that
+# values above 1.0 break structured (JSON) extraction on local models —
+# the penalty distorts token probabilities inside grammar-constrained
+# decoding. Reduce repetition with temperature/top_k instead.
+PARAMETER repeat_penalty 1.0
+
+# ---------------------------------------------------------------------------
+# Intentionally NOT set:
+#
+# - num_predict: the plugin sends an explicit max_tokens on every call
+#   (2,000–16,000 depending on the task); Ollama maps it to num_predict.
+#   A Modelfile value would only fight the plugin's per-task budgets.
+#
+# - SYSTEM: the plugin supplies its own system prompt (language directive,
+#   schema template, wiki labels) on every request. A Modelfile SYSTEM
+#   would be ignored on those calls and only leak into manual `ollama run`
+#   sessions.
+#
+# - TEMPLATE / stop tokens: inherited from the base gemma4:26b model.
+#   Overriding the chat template is the fastest way to break tool-side
+#   parsing — leave it alone.
